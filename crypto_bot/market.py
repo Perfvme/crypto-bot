@@ -80,6 +80,30 @@ class MarketData:
             
         return df
 
+    async def _get_btc_context(self) -> dict:
+        """Fetch BTC daily trend for correlation context."""
+        try:
+            # Fetch just enough data for a quick SMA check
+            df = await self._get_klines("BTCUSDT", "1d", limit=21)
+            if df.empty: return None
+            
+            latest = df.iloc[-1]
+            prev = df.iloc[-2]
+            
+            # Simple Trend (Price vs SMA 20)
+            sma20 = df['close'].rolling(20).mean().iloc[-1]
+            trend = "Bullish" if latest['close'] > sma20 else "Bearish"
+            
+            change_24h = ((latest['close'] - prev['close']) / prev['close']) * 100
+            
+            return {
+                "trend": trend,
+                "change_24h": round(change_24h, 2),
+                "price": latest['close']
+            }
+        except Exception:
+            return None
+
     async def get_futures_data(self, symbol: str) -> dict:
         """
         Fetch Open Interest and Funding Rate from Binance Futures.
@@ -95,9 +119,6 @@ class MarketData:
             # Safe extraction
             funding_rate = float(funding_data.get("lastFundingRate", 0))
             open_interest = float(oi_data.get("openInterest", 0))
-            # OI Value is often returned in base asset amount, sometimes in USDT depending on endpoint
-            # For simplicity, we return the raw amount and let AI interpret trends if we tracked history,
-            # but for a snapshot, the Funding Rate is more critical for sentiment.
             
             return {
                 "funding_rate": funding_rate,
@@ -247,18 +268,28 @@ class MarketData:
         task_ob = self.get_order_book_imbalance(symbol)
         task_futures = self.get_futures_data(symbol)
 
-        results = await asyncio.gather(*tasks, task_ob, task_futures, return_exceptions=True)
+        # --- NEW: BTC Context ---
+        # If we are analyzing BTC, we don't need to fetch it again as context
+        is_btc = "BTC" in symbol.upper()
+        task_btc = asyncio.sleep(0, result=None) if is_btc else self._get_btc_context()
+
+        results = await asyncio.gather(*tasks, task_ob, task_futures, task_btc, return_exceptions=True)
         
         kline_results = results[:3]
         order_book = results[3]
         futures_data = results[4]
+        btc_context = results[5]
         
         analysis = {
             "symbol": symbol,
             "order_book": order_book if not isinstance(order_book, Exception) else "Error",
             "futures_data": futures_data if not isinstance(futures_data, Exception) else "Unavailable",
+            "btc_context": btc_context if not isinstance(btc_context, Exception) else None,
             "timeframes": {}
         }
+
+        trend_signals = {}
+        atr_values = {}
 
         for tf, result in zip(timeframes, kline_results):
             if isinstance(result, Exception):
@@ -277,6 +308,11 @@ class MarketData:
             adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
             df = pd.concat([df, adx_df], axis=1)
 
+            # --- NEW: Volume Analysis ---
+            # Simple RVOL (Relative Volume) vs 20 SMA
+            vol_sma = df['volume'].rolling(window=20).mean()
+            df['rvol'] = df['volume'] / vol_sma
+
             # Advanced Detection
             divergences = self.detect_divergences(df)
             fvgs = self.detect_fvgs(df)
@@ -286,6 +322,21 @@ class MarketData:
 
             latest = df.iloc[-1]
             
+            # Capture signals for Trend Matrix & ATR
+            if tf == "1d":
+                trend_signals["daily_ema200"] = latest["ema_200"] if pd.notnull(latest["ema_200"]) else None
+                trend_signals["daily_close"] = latest["close"]
+            elif tf == "4h":
+                # MACD Histogram > 0? (MACD line - Signal line)
+                # pandas_ta names: MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
+                hist_col = [c for c in df.columns if c.startswith("MACDh")][0]
+                trend_signals["4h_macd_hist"] = latest[hist_col]
+                atr_values["4h"] = latest["atr"]
+            elif tf == "15m":
+                trend_signals["15m_ema50"] = latest["ema_50"] if pd.notnull(latest["ema_50"]) else None
+                trend_signals["15m_close"] = latest["close"]
+                atr_values["15m"] = latest["atr"]
+
             tf_data = {
                 "close": latest["close"],
                 "rsi": round(latest["rsi"], 2) if pd.notnull(latest["rsi"]) else None,
@@ -293,6 +344,7 @@ class MarketData:
                 "ema_50": round(latest["ema_50"], 2) if pd.notnull(latest["ema_50"]) else None,
                 "ema_200": round(latest["ema_200"], 2) if pd.notnull(latest["ema_200"]) else None,
                 "atr": round(latest["atr"], 4) if pd.notnull(latest["atr"]) else None,
+                "rvol": round(latest['rvol'], 2) if pd.notnull(latest['rvol']) else 1.0, # NEW
                 "trend": trend_state,
                 "divergences": divergences,
                 "fvgs": fvgs
@@ -306,7 +358,86 @@ class MarketData:
 
             analysis["timeframes"][tf] = tf_data
 
+        # --- NEW: Post-Processing (Trend Matrix & ATR Stops) ---
+        analysis["trend_matrix"] = self._calculate_trend_matrix(trend_signals)
+        analysis["risk_data"] = self._calculate_risk_levels(trend_signals.get("15m_close"), atr_values)
+
         return analysis
+
+    def _calculate_trend_matrix(self, signals: dict) -> dict:
+        """
+        Generates a multi-timeframe trend score (-3 to +3).
+        """
+        score = 0
+        details = {}
+
+        # 1. Daily Trend (Price vs EMA 200)
+        if signals.get("daily_ema200") and signals.get("daily_close"):
+            if signals["daily_close"] > signals["daily_ema200"]:
+                score += 1
+                details["daily"] = "Bullish"
+            else:
+                score -= 1
+                details["daily"] = "Bearish"
+        else:
+            details["daily"] = "Neutral"
+
+        # 2. 4H Momentum (MACD Hist)
+        if signals.get("4h_macd_hist") is not None:
+            if signals["4h_macd_hist"] > 0:
+                score += 1
+                details["4h"] = "Bullish"
+            else:
+                score -= 1
+                details["4h"] = "Bearish"
+        else:
+            details["4h"] = "Neutral"
+
+        # 3. 15m Trend (Price vs EMA 50)
+        if signals.get("15m_ema50") and signals.get("15m_close"):
+            if signals["15m_close"] > signals["15m_ema50"]:
+                score += 1
+                details["15m"] = "Bullish"
+            else:
+                score -= 1
+                details["15m"] = "Bearish"
+        else:
+            details["15m"] = "Neutral"
+
+        return {
+            "total_score": score,
+            "max_score": 3,
+            "interpretation": "Strong Buy" if score == 3 else "Strong Sell" if score == -3 else "Neutral/Mixed",
+            "details": details
+        }
+
+    def _calculate_risk_levels(self, current_price: float, atr_values: dict) -> dict:
+        """
+        Calculates suggested SL levels based on ATR.
+        """
+        if not current_price: return {}
+
+        risk = {}
+        
+        # Scalp (15m ATR)
+        if atr_values.get("15m"):
+            atr = atr_values["15m"]
+            risk["scalp"] = {
+                "long_sl": round(current_price - (1.5 * atr), 2),
+                "short_sl": round(current_price + (1.5 * atr), 2),
+                "atr_value": round(atr, 2)
+            }
+            
+        # Swing (4h ATR)
+        if atr_values.get("4h"):
+            atr = atr_values["4h"]
+            risk["swing"] = {
+                "long_sl": round(current_price - (2.0 * atr), 2),
+                "short_sl": round(current_price + (2.0 * atr), 2),
+                "atr_value": round(atr, 2)
+            }
+            
+        return risk
 
     def calculate_trend_alignment(self, df: pd.DataFrame) -> str:
         """

@@ -136,32 +136,32 @@ class AIAnalyst:
 Your task is to provide a high-precision trade setup for {symbol}.
 
 **METHODOLOGY (THE DEVIL'S ADVOCATE):**
-1. **Trend Check:** Respect the 'Trend Alignment' (e.g., only Long if Daily is Bullish or at Support).
-2. **Bullish Case:** Analyze reasons to go LONG.
-3. **Bearish Case:** Analyze reasons to go SHORT.
-4. **Clusters:** Use 'SR Clusters' for precise Entry/SL levels (e.g., "Buy at 58k Cluster").
-5. **Conclusion:** Weigh evidence. If conflicting, 'WAIT'.
+1. **Trend Check:** Review [TREND MATRIX].
+   - Score +3 (Strong Bullish): Look for Longs on dips. Avoid Shorts.
+   - Score -3 (Strong Bearish): Look for Shorts on rallies. Avoid Longs.
+   - Score 0 (Neutral): Scalp only, wait for confirmation.
+2. **BTC Correlation:** Check [BTC CONTEXT]. If BTC is strongly bearish, avoid longing weak altcoins unless they show massive relative strength (RVOL).
+3. **Volume Validation:** Check 'rvol' (Relative Volume). RVOL > 1.5 confirms breakout strength.
+4. **Risk Management:** Use [RISK PARAMETERS] for your Stop Loss. Do NOT guess.
+   - Scalp: Use ~1.5x ATR.
+   - Swing: Use ~2.0x ATR.
+5. **Clusters:** Use 'SR Clusters' for precise Entry.
 
-**DATA GUIDELINES:**
-- **Trend Alignment:** "Strong Bullish" = Buy Dips. "Strong Bearish" = Sell Rallies.
-- **Futures:** Positive Funding (>0.01%) = Bullish but squeeze risk.
-- **Order Book:** Ratio > 1.2 (Bullish).
-
-**OUTPUT SCHEMA (JSON Only):**
+**OUTPUT SCHEMA (Raw JSON, no Markdown):**
 {{
   "symbol": "{symbol}",
   "market_sentiment": "bullish|bearish|neutral",
+  "trend_score": "Value from matrix",
   "bull_bear_case": "Concise summary of the conflict.",
-  "news_summary": "Brief summary.",
-  "technical_summary": "Top 3 drivers.",
+  "technical_summary": "Top 3 drivers (Trend/RVOL/BTC).",
   "trade_setup": {{
     "style": "{style}",
     "direction": "long|short|wait",
     "entry_zone": "price",
     "take_profit": "targets",
-    "stop_loss": "level",
+    "stop_loss": "Use calculated risk level",
     "confidence_score": 0-100,
-    "reasoning": "Concise logic for the decision.",
+    "reasoning": "Concise logic. Reference Trend Score.",
     "invalidation": "level",
     "alternative_scenario": "If invalidated..."
   }},
@@ -173,6 +173,15 @@ Your task is to provide a high-precision trade setup for {symbol}.
         # Use default separators for compact JSON to save tokens
         user_content = f"""
 === DATA {symbol} ({style.upper()}) ===
+
+[TREND MATRIX]
+{json.dumps(market_data.get('trend_matrix', {}))}
+
+[RISK PARAMETERS]
+{json.dumps(market_data.get('risk_data', {}))}
+
+[BTC CONTEXT]
+{json.dumps(market_data.get('btc_context', 'N/A'))}
 
 [FUTURES]
 {json.dumps(market_data.get('futures_data', {}))}
@@ -189,7 +198,7 @@ Your task is to provide a high-precision trade setup for {symbol}.
 {crypto_news}
 
 **INSTRUCTION:**
-Act as {style}. Analyze. Be CONCISE. Output JSON.
+Act as {style}. Analyze. Be CONCISE. Output Raw JSON (No Markdown).
 """
 
         # 3. Call API
@@ -214,7 +223,7 @@ Act as {style}. Analyze. Be CONCISE. Output JSON.
             import re
             
             # 1. Try regex for the first JSON object
-            json_match = re.search(r'(\{.*\})', content, re.DOTALL)
+            json_match = re.search(r'(\{[\s\S]*\})', content)
             
             try:
                 if json_match:
